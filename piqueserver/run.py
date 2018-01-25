@@ -4,16 +4,20 @@ import os
 import shutil
 import sys
 import argparse
-import six.moves.urllib as urllib
 import gzip
+import json
+
+import six.moves.urllib as urllib
 
 from piqueserver import cfg
+from piqueserver.config import config, TOML_FORMAT, JSON_FORMAT
 
 MAXMIND_DOWNLOAD = 'http://geolite.maxmind.com/download/geoip/database/GeoLiteCity.dat.gz'
 
 # (major, minor) versions of python we are supporting
 # used on startup to emit a warning if not running on a supported version
-SUPPORTED_PYTHONS = ((2,7), (3,4), (3,5), (3,6))
+SUPPORTED_PYTHONS = ((2, 7), (3, 4), (3, 5), (3, 6))
+
 
 def get_git_rev():
     if not os.path.exists(".git"):
@@ -41,9 +45,11 @@ def copy_config():
         shutil.copytree(config_source, cfg.config_dir)
     except Exception as e:  # pylint: disable=broad-except
         print(e)
-        sys.exit(1)
+        return 1
 
-    print('Complete! Please edit the files in %s to your liking.' % cfg.config_dir)
+    print('Complete! Please edit the files in %s to your liking.' %
+          cfg.config_dir)
+    return 0
 
 
 def update_geoip(target_dir):
@@ -54,7 +60,7 @@ def update_geoip(target_dir):
 
     if not os.path.exists(target_dir):
         print('Configuration directory does not exist')
-        sys.exit(1)
+        return 1
 
     if not os.path.exists(working_directory):
         os.makedirs(working_directory)
@@ -75,11 +81,7 @@ def update_geoip(target_dir):
     print('Cleaning up...')
 
     os.remove(zipped_path)
-
-
-def run_server():
-    from piqueserver import server
-    server.run()
+    return 0
 
 
 def main():
@@ -122,6 +124,21 @@ def main():
     # populate the global config with values from args
     cfg.config_dir = args.config_dir
 
+    # run the required tasks if args given
+    if args.copy_config or args.update_geoip:
+        if args.copy_config:
+            status = copy_config()
+            if status != 0:
+                sys.exit(status)
+
+        if args.update_geoip:
+            status = update_geoip(cfg.config_dir)
+            if status != 0:
+                sys.exit(status)
+
+        return # if we have done a task, don't run the server
+
+
     if args.config_file is None:
         cfg.config_file = os.path.join(cfg.config_dir, 'config.json')
     else:
@@ -129,20 +146,37 @@ def main():
 
     cfg.json_parameters = args.json_parameters
 
-    run = True
+    # find and load the config
+    format_ = None
+    if args.config_file is None:
+        for format__, ext in ((TOML_FORMAT, 'toml'), (JSON_FORMAT, 'json')):
+            config_file = os.path.join(cfg.config_dir, 'config.{}'.format(ext))
+            format_ = format__
+            if os.path.exists(config_file):
+                break
+    else:
+        config_file = args.config_file
+        ext = os.path.splitext(config_file)[1]
+        if ext == '.json':
+            format_ = JSON_FORMAT
+        elif ext == '.toml':
+            format_ = TOML_FORMAT
+        else:
+            raise ValueError(
+                'Unsupported config file format! Must have json or toml extension.')
 
-    # copy config and update geoip can happen at the same time
-    # note that sys.exit is called from either of these functions on failure
-    if args.copy_config:
-        copy_config()
-        run = False
-    if args.update_geoip:
-        update_geoip(cfg.config_dir)
-        run = False
+    print('Loading config from {!r}'.format(config_file))
+    with open(config_file) as fobj:
+        config.load_from_file(fobj, format_=format_)
 
-    # only run the server if other tasks weren't performed
-    if run:
-        run_server()
+    # update config with cli overrides
+    if args.json_parameters:
+        config.update_from_dict(json.loads(args.json_parameters))
+
+
+    from piqueserver import server
+    server.run()
+
 
 if __name__ == "__main__":
     main()

@@ -22,6 +22,7 @@ pyspades - default/featured server
 from __future__ import print_function, unicode_literals
 import sys
 import os
+import errno
 import imp
 import importlib
 import json
@@ -42,6 +43,7 @@ from twisted.python.logfile import DailyLogFile
 from twisted.web import client as web_client
 
 from piqueserver import cfg
+from piqueserver.config import config as config_store
 
 import pyspades.debug
 from pyspades.server import (ServerProtocol, Team)
@@ -61,35 +63,44 @@ from piqueserver.player import FeatureConnection
 # won't be used; just need to be executed
 import piqueserver.core_commands
 
-# default passwords hardcoded in config
-DEFAULT_PASSWORDS = {
-    'admin': ['adminpass1', 'adminpass2', 'adminpass3'],
-    'moderator': ['modpass'],
-    'guard': ['guardpass'],
-    'trusted': ['trustedpass']
-}
+def check_passwords(passwords):
+    '''
+    Validator function to be run when the passwords configuration item is updated/set.
+    Designed to warn if default passwords found in the config.
+    '''
+    # default passwords as hardcoded in example config
+    default_passwords = {
+        'admin': ['adminpass1', 'adminpass2', 'adminpass3'],
+        'moderator': ['modpass'],
+        'guard': ['guardpass'],
+        'trusted': ['trustedpass']
+    }
+
+    # check for default password usage
+    for group, passwords in passwords.items():
+        if group in default_passwords:
+            for password in passwords:
+                if password in default_passwords[group]:
+                    print(("WARNING: FOUND DEFAULT PASSWORD '%s'"
+                           " IN GROUP '%s'" % (password, group)))
+
+    # always validate - this function is just to warn if default passwords found
+    return True
+
 
 PORT = 32887
 
 web_client._HTTP11ClientFactory.noisy = False
 
-
-def create_path(path):
-    if path:
-        try:
-            os.makedirs(path)
-        except OSError:
+def ensure_dir_exists(filename):
+    d = os.path.dirname(filename)
+    try:
+        os.makedirs(d)
+    except OSError as e:
+        if e.errno == errno.EEXIST:
             pass
-
-
-def create_filename_path(path):
-    create_path(os.path.dirname(path))
-
-
-def open_create(filename, mode):
-    create_filename_path(filename)
-    return open(filename, mode)
-
+        else:
+            raise e
 
 def random_choice_cycle(choices):
     while True:
@@ -199,13 +210,22 @@ class FeatureProtocol(ServerProtocol):
         self.advance_on_win = int(config.get('advance_on_win', False))
         self.win_count = itertools.count(1)
         self.bans = NetworkDict()
-        # TODO: check if this is actually working and not silently failing
+
+        # attempt to load a saved bans list
         try:
-            self.bans.read_list(
-                json.load(open(os.path.join(cfg.config_dir, 'bans.txt'), 'r'))
-            )
-        except IOError:
-            pass
+            with open(os.path.join(cfg.config_dir, 'bans.txt'), 'r') as f:
+                self.bans.read_list(json.load(f))
+        except OSError as e:
+            if e.errno == errno.ENOENT:
+                # if it doesn't exist, then no bans, no error
+                pass
+            else:
+                raise e
+        except IOError as e:
+            print('Could not read bans.txt: {}'.format(e))
+        except ValueError as e:
+            print('Could not parse bans.txt: {}'.format(e))
+
         self.hard_bans = set()  # possible DDoS'ers are added here
         self.player_memory = deque(maxlen=100)
         self.config = config
@@ -237,7 +257,7 @@ class FeatureProtocol(ServerProtocol):
         self.max_players = config.get('max_players', 20)
         self.melee_damage = config.get('melee_damage', 100)
         self.max_connections_per_ip = config.get('max_connections_per_ip', 0)
-        self.passwords = config.get('passwords', {})
+        self.passwords = config_store.option('passwords', default={}, validate=check_passwords).get()
         self.server_prefix = config.get('server_prefix', '[*]')
         self.time_announcements = config.get('time_announcements',
                                              [1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
@@ -282,11 +302,11 @@ class FeatureProtocol(ServerProtocol):
         if not os.path.isabs(logfile):
             logfile = os.path.join(cfg.config_dir, logfile)
         if logfile.strip():  # catches empty filename
+            ensure_dir_exists(logfile)
             if config.get('rotate_daily', False):
-                create_filename_path(logfile)
                 logging_file = DailyLogFile(logfile, '.')
             else:
-                logging_file = open_create(logfile, 'a')
+                logging_file = open(logfile, 'a')
             log.addObserver(log.FileLogObserver(logging_file).emit)
             log.msg('pyspades server started on %s' % time.strftime('%c'))
         log.startLogging(sys.stdout)  # force twisted logging
@@ -295,14 +315,6 @@ class FeatureProtocol(ServerProtocol):
         self.end_calls = []
         # TODO: why is this here?
         create_console(self)
-
-        # check for default password usage
-        for group, passwords in self.passwords.items():
-            if group in DEFAULT_PASSWORDS:
-                for password in passwords:
-                    if password in DEFAULT_PASSWORDS[group]:
-                        print(("WARNING: FOUND DEFAULT PASSWORD '%s'"
-                               " IN GROUP '%s'" % (password, group)))
 
         for password in self.passwords.get('admin', []):
             if not password:
@@ -315,9 +327,10 @@ class FeatureProtocol(ServerProtocol):
         port = self.port = config.get('port', 32887)
         ServerProtocol.__init__(self, port, interface)
         self.host.intercept = self.receive_callback
-        ret = self.set_map_rotation(config['maps'])
-        if not ret:
-            print('Invalid map in map rotation (%s), exiting.' % ret.map)
+        try:
+            self.set_map_rotation(config['maps'])
+        except MapNotFound as e:
+            print('Invalid map in map rotation (%s), exiting.' % e.map)
             raise SystemExit
 
         self.update_format()
@@ -411,6 +424,10 @@ class FeatureProtocol(ServerProtocol):
         self.advance_rotation('Time up!')
 
     def advance_rotation(self, message=None):
+        """
+        Advances to the next map in the rotation. If message is provided
+        it will send it to the chat, waits for 10 seconds and then advances.
+        """
         self.set_time_limit(False)
         if self.planned_map is None:
             self.planned_map = next(self.map_rotator)
@@ -429,10 +446,10 @@ class FeatureProtocol(ServerProtocol):
         return self.game_mode_name
 
     def set_map_name(self, rot_info):
-        try:
-            map_info = self.get_map(rot_info)
-        except MapNotFound as e:
-            return e
+        """
+        Sets the map by its name.
+        """
+        map_info = self.get_map(rot_info)
         if self.map_info:
             self.on_map_leave()
         self.map_info = map_info
@@ -440,21 +457,23 @@ class FeatureProtocol(ServerProtocol):
         self.set_map(self.map_info.data)
         self.set_time_limit(self.map_info.time_limit)
         self.update_format()
-        return True
 
     def get_map(self, rot_info):
+        """
+        Creates and returns a Map object from rotation info
+        """
         return Map(rot_info, os.path.join(cfg.config_dir, 'maps'))
 
     def set_map_rotation(self, maps, now=True):
-        try:
-            maps = check_rotation(maps, os.path.join(cfg.config_dir, 'maps'))
-        except MapNotFound as e:
-            return e
+        """
+        Over-writes the current map rotation with provided one.
+        And advances immediately with the new rotation by default.
+        """
+        maps = check_rotation(maps, os.path.join(cfg.config_dir, 'maps'))
         self.maps = maps
         self.map_rotator = self.map_rotator_type(maps)
         if now:
             self.advance_rotation()
-        return True
 
     def get_map_rotation(self):
         return [map_item.full_name for map_item in self.maps]
@@ -572,16 +591,23 @@ class FeatureProtocol(ServerProtocol):
         return result
 
     def save_bans(self):
-        json.dump(self.bans.make_list(), open_create(
-            os.path.join(cfg.config_dir, 'bans.txt'), 'w'))
+        ban_file = os.path.join(cfg.config_dir, 'bans.txt')
+        ensure_dir_exists(ban_file)
+        with open(ban_file, 'w') as f:
+            json.dump(self.bans.make_list(), f, indent=2)
         if self.ban_publish is not None:
             self.ban_publish.update()
 
     def receive_callback(self, address, data):
+        """This hook recieves the raw UDP data before it is processed by enet"""
+
+        # reply to ASCII HELLO messages with HI so that clients can measure the
+        # connection latency
         if data == b'HELLO':
-            print("test")
             self.host.socket.send(address, b'HI')
             return 1
+
+        # This drop the connection of any ip in hard_bans
         if address.host in self.hard_bans:
             return 1
 
@@ -605,9 +631,9 @@ class FeatureProtocol(ServerProtocol):
     def irc_say(self, msg, me=False):
         if self.irc_relay:
             if me:
-                self.irc_relay.me(msg, filter=True)
+                self.irc_relay.me(msg, do_filter=True)
             else:
-                self.irc_relay.send(msg, filter=True)
+                self.irc_relay.send(msg, do_filter=True)
 
     def send_tip(self):
         line = self.tips[random.randrange(len(self.tips))]
